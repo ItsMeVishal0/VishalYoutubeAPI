@@ -104,54 +104,188 @@ async def rate_limit_middleware(request: Request, call_next):
     
     return response
 
-# YouTube downloader with enhanced options
+# Enhanced YouTubeDownloader class
 class YouTubeDownloader:
     @staticmethod
     def get_ydl_options(video_type: str = "video", quality: str = "best"):
-        """Get yt-dlp options"""
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'no_color': True,
-            'extract_flat': False,
-            'geo_bypass': True,
-            'geo_bypass_country': 'IN',  # India
-            'socket_timeout': config.YTDLP_TIMEOUT,
-            'retries': 3,
-            'fragment_retries': 3,
-            'skip_unavailable_fragments': True,
-            'concurrent_fragment_downloads': 4,  # Parallel downloads
-            'throttledratelimit': 1024000,  # 1 MB/s limit
-            'verbose': False,
-        }
+        """Get yt-dlp options with enhanced audio extraction"""
+        ydl_opts = config.YTDLP_DEFAULT_OPTS.copy()
         
-        # Add cookies if available
+        # Add cookies if available (CRITICAL FOR AUDIO)
         if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
             ydl_opts['cookiefile'] = config.COOKIES_FILE
-        
-        # Format selection
-        if video_type == "audio":
-            ydl_opts['format'] = 'bestaudio/best'
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }]
-        elif video_type == "video":
-            if quality == "low":
-                ydl_opts['format'] = 'best[height<=360][filesize<20M]/best[height<=240]/worst'
-            elif quality == "medium":
-                ydl_opts['format'] = 'best[height<=480][filesize<50M]/best[height<=360]/best'
-            elif quality == "high":
-                ydl_opts['format'] = 'best[height<=720][filesize<100M]/best[height<=480]/best'
-            else:  # best
-                ydl_opts['format'] = 'best[height<=1080][filesize<200M]/best[height<=720]/best'
+            logger.info(f"🍪 Using cookies from {config.COOKIES_FILE}")
         
         # Add proxy if configured
         if config.PROXY:
             ydl_opts['proxy'] = config.PROXY
+            logger.info(f"🌐 Using proxy: {config.PROXY}")
+        
+        # Region bypass for India
+        ydl_opts['geo_bypass'] = True
+        ydl_opts['geo_bypass_country'] = 'IN'
+        
+        # Format selection
+        if video_type == "audio":
+            # Enhanced audio format selection
+            ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best'
+            ydl_opts['postprocessors'] = []
+            
+            # Try multiple YouTube extractor settings
+            ydl_opts['extractor_args'].update({
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web', 'tvhtml5'],
+                    'player_skip': ['configs', 'webpage'],
+                    'skip': ['hls', 'dash'],
+                }
+            })
+            
+            # Don't require audio-only format, accept video+audio
+            ydl_opts['format'] = 'best[acodec!=none]'
+            
+        elif video_type == "video":
+            if quality == "low":
+                ydl_opts['format'] = 'best[height<=360]'
+            elif quality == "medium":
+                ydl_opts['format'] = 'best[height<=480]'
+            elif quality == "high":
+                ydl_opts['format'] = 'best[height<=720]'
+            else:  # best
+                ydl_opts['format'] = 'best[height<=1080]/best'
         
         return ydl_opts
+    
+    @staticmethod
+    async def get_audio_stream(url: str, use_cookies: bool = True) -> Dict[str, Any]:
+        """Specialized method for audio streaming with multiple fallbacks"""
+        video_id = youtube_utils.extract_video_id(url)
+        logger.info(f"🎵 Attempting audio extraction for: {video_id}")
+        
+        # Method 1: Try with cookies (most likely to work)
+        if use_cookies and config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+            result = await YouTubeDownloader._try_audio_method(
+                url, video_id, "cookies_method", use_cookies=True
+            )
+            if result['status'] == 'success':
+                return result
+        
+        # Method 2: Try without audio-only restriction
+        result = await YouTubeDownloader._try_audio_method(
+            url, video_id, "mixed_format_method", accept_video=True
+        )
+        if result['status'] == 'success':
+            return result
+        
+        # Method 3: Try DASH audio extraction
+        result = await YouTubeDownloader._try_audio_method(
+            url, video_id, "dash_method", extract_dash=True
+        )
+        if result['status'] == 'success':
+            return result
+        
+        # Method 4: Last resort - try generic extractor
+        result = await YouTubeDownloader._try_audio_method(
+            url, video_id, "generic_method", force_generic=True
+        )
+        
+        return result
+    
+    @staticmethod
+    async def _try_audio_method(url: str, video_id: str, method_name: str, **kwargs) -> Dict[str, Any]:
+        """Try a specific audio extraction method"""
+        try:
+            logger.info(f"🔄 Trying {method_name} for {video_id}")
+            
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+                'socket_timeout': 30,
+                'ignoreerrors': True,
+            }
+            
+            # Add cookies if requested and available
+            if kwargs.get('use_cookies') and config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+                ydl_opts['cookiefile'] = config.COOKIES_FILE
+            
+            # Format selection based on method
+            if method_name == "cookies_method":
+                ydl_opts['format'] = 'bestaudio/best'
+            elif method_name == "mixed_format_method":
+                # Accept video+audio formats and extract audio
+                ydl_opts['format'] = 'best[acodec!=none]'
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }]
+            elif method_name == "dash_method":
+                # Try DASH audio specifically
+                ydl_opts['format'] = 'bestaudio[protocol=dash]/bestaudio'
+            elif method_name == "generic_method":
+                ydl_opts['force_generic_extractor'] = True
+                ydl_opts['format'] = 'best'
+            
+            # Add proxy if configured
+            if config.PROXY:
+                ydl_opts['proxy'] = config.PROXY
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                
+                if not info:
+                    return {'status': 'error', 'message': 'No video info found'}
+                
+                formats = info.get('formats', [])
+                
+                # Find suitable format
+                suitable_formats = []
+                for fmt in formats:
+                    # For mixed format method, accept any format with audio
+                    if method_name == "mixed_format_method" and fmt.get('acodec') != 'none':
+                        suitable_formats.append(fmt)
+                    # For other methods, look for audio-only or best audio
+                    elif fmt.get('acodec') != 'none' and (fmt.get('vcodec') == 'none' or method_name != "mixed_format_method"):
+                        suitable_formats.append(fmt)
+                
+                if not suitable_formats:
+                    return {'status': 'error', 'message': f'No suitable formats in {method_name}'}
+                
+                # Sort by bitrate/quality
+                suitable_formats.sort(
+                    key=lambda x: (
+                        x.get('abr', 0) or x.get('tbr', 0) or 0,
+                        x.get('asr', 0) or 0,
+                        x.get('filesize', 0) or 0
+                    ),
+                    reverse=True
+                )
+                
+                best_format = suitable_formats[0]
+                
+                return {
+                    'status': 'success',
+                    'video_id': video_id,
+                    'title': info.get('title', 'Unknown Title'),
+                    'duration': info.get('duration', 0),
+                    'stream_url': best_format['url'],
+                    'type': 'audio',
+                    'format': {
+                        'ext': best_format.get('ext', 'm4a'),
+                        'abr': best_format.get('abr', 128),
+                        'asr': best_format.get('asr', 44100),
+                        'vcodec': best_format.get('vcodec', 'none'),
+                        'acodec': best_format.get('acodec', 'none'),
+                        'filesize': best_format.get('filesize'),
+                        'protocol': best_format.get('protocol', ''),
+                        'format_note': best_format.get('format_note', '')
+                    },
+                    'method_used': method_name
+                }
+                
+        except Exception as e:
+            logger.error(f"{method_name} failed: {e}")
+            return {'status': 'error', 'message': f'{method_name}: {str(e)}'}
     
     @staticmethod
     async def get_stream_info(url: str, video_type: str = "video", quality: str = "best") -> Dict[str, Any]:
@@ -170,69 +304,35 @@ class YouTubeDownloader:
             
             logger.info(f"🔍 Processing: {video_id} | Type: {video_type} | Quality: {quality}")
             
-            ydl_opts = YouTubeDownloader.get_ydl_options(video_type, quality)
-            
-            # Use yt-dlp to get info
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            # Use specialized method for audio
+            if video_type == "audio":
+                result = await YouTubeDownloader.get_audio_stream(url)
+            else:
+                ydl_opts = YouTubeDownloader.get_ydl_options(video_type, quality)
                 
-                if not info:
-                    raise ValueError("Could not extract video info")
-                
-                result = {
-                    'status': 'success',
-                    'video_id': video_id,
-                    'title': info.get('title', 'Unknown Title'),
-                    'duration': info.get('duration', 0),
-                    'thumbnail': info.get('thumbnail', ''),
-                    'channel': info.get('channel', 'Unknown Channel'),
-                    'view_count': info.get('view_count', 0),
-                    'like_count': info.get('like_count', 0),
-                    'upload_date': info.get('upload_date', ''),
-                }
-                
-                # Get direct stream URL
-                if video_type == "audio":
-                    # Find best audio format
-                    audio_formats = []
-                    for fmt in info.get('formats', []):
-                        if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
-                            audio_formats.append(fmt)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
                     
-                    if audio_formats:
-                        # Sort by quality
-                        audio_formats.sort(
-                            key=lambda x: x.get('abr', 0) or x.get('tbr', 0), 
-                            reverse=True
-                        )
-                        best_audio = audio_formats[0]
-                        
-                        result.update({
-                            'stream_url': best_audio['url'],
-                            'type': 'audio',
-                            'format': {
-                                'ext': best_audio.get('ext', 'mp3'),
-                                'abr': best_audio.get('abr', 128),
-                                'filesize': best_audio.get('filesize'),
-                                'format_note': best_audio.get('format_note', '')
-                            }
-                        })
-                    else:
-                        raise ValueError("No audio format found")
-                
-                elif video_type == "video":
+                    if not info:
+                        raise ValueError("Could not extract video info")
+                    
+                    result = {
+                        'status': 'success',
+                        'video_id': video_id,
+                        'title': info.get('title', 'Unknown Title'),
+                        'duration': info.get('duration', 0),
+                        'thumbnail': info.get('thumbnail', ''),
+                        'channel': info.get('channel', 'Unknown Channel'),
+                        'view_count': info.get('view_count', 0),
+                        'like_count': info.get('like_count', 0),
+                        'upload_date': info.get('upload_date', ''),
+                    }
+                    
                     # Find best video format
-                    video_formats = []
-                    for fmt in info.get('formats', []):
-                        if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
-                            # Check filesize limit
-                            filesize = fmt.get('filesize') or fmt.get('filesize_approx')
-                            if filesize and filesize > config.MAX_DOWNLOAD_SIZE:
-                                continue
-                            video_formats.append(fmt)
+                    video_formats = [f for f in info.get('formats', []) 
+                                   if f.get('vcodec') != 'none']
                     
                     if video_formats:
-                        # Sort by quality
                         video_formats.sort(
                             key=lambda x: (
                                 x.get('height', 0) or 0,
@@ -241,7 +341,6 @@ class YouTubeDownloader:
                             ),
                             reverse=True
                         )
-                        
                         best_video = video_formats[0]
                         result.update({
                             'stream_url': best_video['url'],
@@ -257,11 +356,12 @@ class YouTubeDownloader:
                         })
                     else:
                         raise ValueError("No suitable video format found")
-                
-                # Cache the result
+            
+            # Cache successful results
+            if result['status'] == 'success':
                 await cache.set(cache_key, result)
-                
-                return result
+            
+            return result
                 
         except Exception as e:
             logger.error(f"❌ Error getting stream info: {e}")
@@ -353,46 +453,93 @@ async def stream_video(
 @app.get("/stream/audio")
 async def stream_audio(
     request: Request,
-    url: str = Query(..., description="YouTube video URL")
+    url: str = Query(..., description="YouTube video URL"),
+    force_refresh: bool = Query(False, description="Force refresh, bypass cache")
 ):
     """
-    Stream YouTube audio directly
-    Returns redirect to direct audio stream URL
+    Stream YouTube audio directly with multiple fallback methods
     """
     if not youtube_utils.is_valid_youtube_url(url):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
     
     try:
-        result = await downloader.get_stream_info(url, "audio")
+        video_id = youtube_utils.extract_video_id(url)
+        
+        # Check cache if not forcing refresh
+        if not force_refresh:
+            cache_key = f"audio:{video_id}"
+            cached_result = await cache.get(cache_key)
+            if cached_result and cached_result.get('status') == 'success':
+                logger.info(f"🎵 Using cached audio for {video_id}")
+                result = cached_result
+            else:
+                result = await downloader.get_audio_stream(url)
+        else:
+            result = await downloader.get_audio_stream(url)
         
         if result['status'] != 'success':
-            raise HTTPException(status_code=500, detail=result.get('message', 'Stream error'))
+            # Try one more time without cookies if cookies method failed
+            if "cookies" in result.get('message', '').lower():
+                logger.info("🔄 Retrying without cookies...")
+                result = await downloader.get_audio_stream(url, use_cookies=False)
+            
+            if result['status'] != 'success':
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Audio extraction failed: {result.get('message', 'Unknown error')}. "
+                          f"Video may be age-restricted or region-locked. Try adding cookies.txt file."
+                )
         
         stream_url = result['stream_url']
+        method_used = result.get('method_used', 'unknown')
         
-        logger.info(f"🎵 Streaming audio: {result.get('title', 'Unknown')}")
+        logger.info(f"🎵 Streaming audio: {result.get('title', 'Unknown')} | Method: {method_used}")
         
-        # Return redirect
+        # Return redirect with enhanced headers
         response = RedirectResponse(url=stream_url, status_code=302)
         
-        # Audio headers
         response.headers.update({
             "Accept-Ranges": "bytes",
-            "Content-Type": "audio/mpeg",
-            "Cache-Control": "public, max-age=7200",
+            "Content-Type": get_content_type(result.get('format', {}).get('ext', 'm4a')),
+            "Cache-Control": "public, max-age=86400",  # 24 hours
             "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "*",
             "X-Audio-Title": youtube_utils.clean_title(result.get('title', '')),
             "X-Audio-Bitrate": str(result.get('format', {}).get('abr', 128)),
-            "X-Video-Id": result.get('video_id', '')
+            "X-Audio-Codec": result.get('format', {}).get('acodec', 'unknown'),
+            "X-Video-Codec": result.get('format', {}).get('vcodec', 'none'),
+            "X-Video-Id": result.get('video_id', ''),
+            "X-Extraction-Method": method_used,
+            "X-Stream-Url-Hash": hashlib.md5(stream_url.encode()).hexdigest()[:8]
         })
+        
+        # Cache successful result
+        if result['status'] == 'success':
+            cache_key = f"audio:{video_id}"
+            await cache.set(cache_key, result)
         
         return response
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Stream audio error: {e}")
+        logger.error(f"🎵 Stream audio error: {e}")
         raise HTTPException(status_code=500, detail=f"Audio streaming error: {str(e)}")
+
+
+def get_content_type(ext: str) -> str:
+    """Get content type based on file extension"""
+    content_types = {
+        'mp3': 'audio/mpeg',
+        'm4a': 'audio/mp4',
+        'webm': 'audio/webm',
+        'ogg': 'audio/ogg',
+        'opus': 'audio/ogg',
+        'flac': 'audio/flac',
+        'wav': 'audio/wav',
+        'aac': 'audio/aac',
+    }
+    return content_types.get(ext.lower(), 'audio/mpeg')
 
 @app.get("/info")
 async def get_video_info(
@@ -755,6 +902,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
+        
 
 # Error handlers
 @app.exception_handler(HTTPException)
